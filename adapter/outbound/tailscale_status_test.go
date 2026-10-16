@@ -5,8 +5,38 @@ package outbound
 import (
 	"context"
 	"errors"
+	"os"
 	"testing"
+
+	C "github.com/metacubex/mihomo/constant"
 )
+
+func newTestTailscale(t *testing.T, option TailscaleOption) *Tailscale {
+	t.Helper()
+	if option.Name == "" {
+		option.Name = "ts"
+	}
+	if option.StateDir == "" {
+		option.StateDir = "tailscale/test"
+	}
+	node, err := NewTailscale(option)
+	if err != nil {
+		t.Skipf("tailscale outbound unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = node.Close() })
+	return node
+}
+
+func TestMain(m *testing.M) {
+	home, err := os.MkdirTemp("", "ts-home")
+	if err != nil {
+		panic(err)
+	}
+	C.SetHomeDir(home)
+	code := m.Run()
+	_ = os.RemoveAll(home)
+	os.Exit(code)
+}
 
 func TestTailscaleStatusBeforeStart(t *testing.T) {
 	node := &Tailscale{}
@@ -18,17 +48,27 @@ func TestTailscaleStatusBeforeStart(t *testing.T) {
 	}
 }
 
-func TestTailscaleStatusFromOption(t *testing.T) {
-	node, err := NewTailscale(TailscaleOption{
-		BasicOption: BasicOption{},
-		Name:        "ts",
-		StateDir:    t.TempDir(),
-	})
-	if err != nil {
-		t.Skipf("tailscale outbound unavailable: %v", err)
+func TestUnwrapTailscaleThroughAutoClose(t *testing.T) {
+	node := newTestTailscale(t, TailscaleOption{})
+	got, ok := UnwrapTailscale(NewAutoCloseProxyAdapter(node))
+	if !ok || got != node {
+		t.Fatal("the parser's auto-close wrapper must unwrap to the node")
 	}
-	defer node.Close()
-	if _, err := node.Status(context.Background()); !errors.Is(err, ErrTailscaleNotStarted) {
-		t.Fatalf("expected ErrTailscaleNotStarted, got %v", err)
+	if _, ok := UnwrapTailscale(nil); ok {
+		t.Fatal("nil must not unwrap")
+	}
+}
+
+func TestTailscaleSameConfig(t *testing.T) {
+	dir := "tailscale/same"
+	yes := true
+	a := newTestTailscale(t, TailscaleOption{StateDir: dir, AuthKey: "k", AcceptRoutes: &yes})
+	b := newTestTailscale(t, TailscaleOption{StateDir: dir, AuthKey: "k", AcceptRoutes: &yes})
+	c := newTestTailscale(t, TailscaleOption{StateDir: dir, AuthKey: "other"})
+	if !a.SameConfig(b) {
+		t.Fatal("identical options must match")
+	}
+	if a.SameConfig(c) || a.SameConfig(nil) {
+		t.Fatal("different options must not match")
 	}
 }
