@@ -102,3 +102,8 @@ func TestTailscaleWaitAndPingBeforeStart(t *testing.T) {
 		t.Fatalf("expected ErrTailscaleNotStarted, got %v", err)
 	}
 }
+
+func TestTailscaleNetworkChangedBeforeStart(t *testing.T) {
+	(&Tailscale{}).NetworkChanged()
+	newTestTailscale(t, TailscaleOption{}).NetworkChanged()
+}
