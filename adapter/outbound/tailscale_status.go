@@ -108,6 +108,25 @@ func (t *Tailscale) WaitSettled(ctx context.Context) (state, authURL string, err
 	}
 }
 
+// NetworkChanged makes the node re-check the network now. On Android tsnet
+// only polls for link changes every ten minutes and counts on the host app to
+// report them, so without this a switch between Wi-Fi and mobile data leaves
+// the node on dead sockets for minutes. The check closes the connections the
+// switch broke, rebinds magicsock and reconnects DERP and control; the node
+// and its login stay as they are.
+func (t *Tailscale) NetworkChanged() {
+	if !t.serverStarted || t.server == nil {
+		return
+	}
+	sys := t.server.Sys()
+	if sys == nil {
+		return
+	}
+	if monitor, ok := sys.NetMon.GetOK(); ok && monitor != nil {
+		monitor.InjectEvent()
+	}
+}
+
 // Ping sends one ping of pingType to ip through the node. A disco ping also
 // tells whether the path is direct or through a relay.
 func (t *Tailscale) Ping(ctx context.Context, ip netip.Addr, pingType tailcfg.PingType) (*ipnstate.PingResult, error) {
