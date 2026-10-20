@@ -5,6 +5,7 @@ package outbound
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"os"
 	"testing"
 
@@ -70,5 +71,34 @@ func TestTailscaleSameConfig(t *testing.T) {
 	}
 	if a.SameConfig(c) || a.SameConfig(nil) {
 		t.Fatal("different options must not match")
+	}
+}
+
+func TestTailscaleSettled(t *testing.T) {
+	for _, tc := range []struct {
+		state, url string
+		want       bool
+	}{
+		{"NoState", "", false},
+		{"Starting", "", false},
+		{"NeedsLogin", "", false},
+		{"NeedsLogin", "https://login.tailscale.com/a/x", true},
+		{"NeedsMachineAuth", "", true},
+		{"Running", "", true},
+		{"Stopped", "", true},
+	} {
+		if got := TailscaleSettled(tc.state, tc.url); got != tc.want {
+			t.Errorf("TailscaleSettled(%q, %q) = %v, want %v", tc.state, tc.url, got, tc.want)
+		}
+	}
+}
+
+func TestTailscaleWaitAndPingBeforeStart(t *testing.T) {
+	node := &Tailscale{}
+	if _, _, err := node.WaitSettled(context.Background()); !errors.Is(err, ErrTailscaleNotStarted) {
+		t.Fatalf("expected ErrTailscaleNotStarted, got %v", err)
+	}
+	if _, err := node.Ping(context.Background(), netip.MustParseAddr("100.64.0.1"), "disco"); !errors.Is(err, ErrTailscaleNotStarted) {
+		t.Fatalf("expected ErrTailscaleNotStarted, got %v", err)
 	}
 }
