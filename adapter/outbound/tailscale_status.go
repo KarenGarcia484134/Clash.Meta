@@ -10,10 +10,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/dns"
+	"github.com/metacubex/tailscale/ipn"
 	"github.com/metacubex/tailscale/ipn/ipnstate"
+	"github.com/metacubex/tailscale/tailcfg"
 )
 
 var ErrTailscaleNotStarted = errors.New("tailscale node is not started")
@@ -54,6 +57,68 @@ func (t *Tailscale) Status(ctx context.Context) (*ipnstate.Status, error) {
 		return nil, err
 	}
 	return lc.Status(ctx)
+}
+
+// TailscaleSettled reports whether the node stays in state without more work
+// of its own. A fresh node passes through NeedsLogin before the control
+// client has logged in with its saved key, so NeedsLogin only counts once
+// there is a login URL to show.
+func TailscaleSettled(state, authURL string) bool {
+	switch state {
+	case ipn.Running.String(), ipn.NeedsMachineAuth.String(), ipn.Stopped.String():
+		return true
+	case ipn.NeedsLogin.String():
+		return authURL != ""
+	}
+	return false
+}
+
+// WaitSettled follows the IPN bus until the node settles or ctx ends, and
+// returns the last state and login URL it saw.
+func (t *Tailscale) WaitSettled(ctx context.Context) (state, authURL string, err error) {
+	if !t.serverStarted {
+		return "", "", ErrTailscaleNotStarted
+	}
+	lc, err := t.server.LocalClient()
+	if err != nil {
+		return "", "", err
+	}
+	watcher, err := lc.WatchIPNBus(ctx, ipn.NotifyInitialState)
+	if err != nil {
+		return "", "", err
+	}
+	defer watcher.Close()
+	for {
+		n, err := watcher.Next()
+		if err != nil {
+			if ctx.Err() != nil {
+				return state, authURL, nil
+			}
+			return state, authURL, err
+		}
+		if n.State != nil {
+			state = n.State.String()
+		}
+		if n.BrowseToURL != nil {
+			authURL = *n.BrowseToURL
+		}
+		if TailscaleSettled(state, authURL) {
+			return state, authURL, nil
+		}
+	}
+}
+
+// Ping sends one ping of pingType to ip through the node. A disco ping also
+// tells whether the path is direct or through a relay.
+func (t *Tailscale) Ping(ctx context.Context, ip netip.Addr, pingType tailcfg.PingType) (*ipnstate.PingResult, error) {
+	if !t.serverStarted {
+		return nil, ErrTailscaleNotStarted
+	}
+	lc, err := t.server.LocalClient()
+	if err != nil {
+		return nil, err
+	}
+	return lc.Ping(ctx, ip, pingType)
 }
 
 func tailscaleOptionKey(option TailscaleOption) string {
