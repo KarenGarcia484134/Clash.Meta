@@ -222,3 +222,18 @@ func TestTailscaleSystemPacketListenerWithDialerProxy(t *testing.T) {
 	}
 	_ = pc.Close()
 }
+
+func TestTailscaleExitNodeError(t *testing.T) {
+	node := &Tailscale{}
+	if node.ExitNodeError() != "" {
+		t.Fatal("no error before an apply")
+	}
+	node.setExitNodeErr(errors.New("node 100.64.0.9 is not advertising an exit node"))
+	if node.ExitNodeError() == "" {
+		t.Fatal("the apply error must be kept")
+	}
+	node.setExitNodeErr(nil)
+	if node.ExitNodeError() != "" {
+		t.Fatal("a later success clears it")
+	}
+}

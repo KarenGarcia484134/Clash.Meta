@@ -214,3 +214,19 @@ func (t *Tailscale) Reconnect(ctx context.Context) error {
 	}
 	return nil
 }
+
+func (t *Tailscale) setExitNodeErr(err error) {
+	t.exitNodeMu.Lock()
+	t.exitNodeErr = err
+	t.exitNodeMu.Unlock()
+}
+
+// ExitNodeError is why the configured exit node could not be set, or empty.
+func (t *Tailscale) ExitNodeError() string {
+	t.exitNodeMu.Lock()
+	defer t.exitNodeMu.Unlock()
+	if t.exitNodeErr == nil {
+		return ""
+	}
+	return t.exitNodeErr.Error()
+}

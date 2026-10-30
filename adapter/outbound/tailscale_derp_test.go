@@ -107,3 +107,61 @@ func TestDialSystemRoutesSelfHostedDERPDirectly(t *testing.T) {
 		t.Fatal("a region no longer in the map must use the proxy")
 	}
 }
+
+type closeCounter struct {
+	net.Conn
+	closed *int
+}
+
+func (c closeCounter) Close() error { *c.closed++; return c.Conn.Close() }
+
+type countingDialer struct{ closed int }
+
+func (d *countingDialer) DialContext(context.Context, string, string) (net.Conn, error) {
+	a, b := net.Pipe()
+	_ = b.Close()
+	return closeCounter{Conn: a, closed: &d.closed}, nil
+}
+
+// The home DERP is dialed from the cached map before the netmap arrives;
+// once the map shows the node is self-hosted that proxied connection is
+// closed so derphttp redials it directly, and the route is reported.
+func TestDERPConnDialedBeforeTheMapIsRedialedDirectly(t *testing.T) {
+	var routes tailscaleDERPRoutes
+	proxy := &countingDialer{}
+	direct := &fakeStreamDialer{}
+	directOf := func() tailscaleStreamDialer { return direct }
+
+	early, err := dialSystemVia(context.Background(), &routes, proxy, "group", directOf, "ts", "tcp", "203.0.113.7:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, err := dialSystemVia(context.Background(), &routes, proxy, "group", directOf, "ts", "tcp", "1.1.1.4:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes.set(testDERPMap())
+	if proxy.closed != 1 {
+		t.Fatalf("the proxied self-hosted DERP conn must be closed once, got %d", proxy.closed)
+	}
+	_ = early.Close()
+	_ = control.Close()
+
+	conn, err := dialSystemVia(context.Background(), &routes, proxy, "group", directOf, "ts", "tcp", "203.0.113.7:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	if len(direct.calls) != 1 {
+		t.Fatalf("redial must be direct: %v", direct.calls)
+	}
+	conn, err = dialSystemVia(context.Background(), &routes, proxy, "group", directOf, "ts", "tcp", "1.1.1.4:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	got := routes.Routes()
+	if got["tx-cd-derp"] != TailscaleRouteDirect || got["fra"] != TailscaleRouteProxy {
+		t.Fatalf("routes = %v", got)
+	}
+}
