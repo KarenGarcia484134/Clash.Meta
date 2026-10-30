@@ -5,6 +5,7 @@ package outbound
 import (
 	"context"
 	"errors"
+	"net"
 	"net/netip"
 	"os"
 	"testing"
@@ -106,4 +107,118 @@ func TestTailscaleWaitAndPingBeforeStart(t *testing.T) {
 func TestTailscaleNetworkChangedBeforeStart(t *testing.T) {
 	(&Tailscale{}).NetworkChanged()
 	newTestTailscale(t, TailscaleOption{}).NetworkChanged()
+}
+
+func TestTailscaleNeedsReconnect(t *testing.T) {
+	for _, tc := range []struct {
+		state, url string
+		want       bool
+	}{
+		{"NeedsLogin", "", true},
+		{"NeedsLogin", "https://login.tailscale.com/a/x", false},
+		{"NoState", "", true},
+		{"Starting", "", true},
+		{"Running", "", false},
+		{"Stopped", "", false},
+		{"NeedsMachineAuth", "", false},
+	} {
+		if got := TailscaleNeedsReconnect(tc.state, tc.url); got != tc.want {
+			t.Errorf("TailscaleNeedsReconnect(%q, %q) = %v, want %v", tc.state, tc.url, got, tc.want)
+		}
+	}
+	if err := (&Tailscale{}).Reconnect(context.Background()); !errors.Is(err, ErrTailscaleNotStarted) {
+		t.Fatalf("expected ErrTailscaleNotStarted, got %v", err)
+	}
+}
+
+// The node's control dial must go through its dialer-proxy and never fall
+// back to dialing directly, which a censored network resets.
+func TestTailscaleSystemDialerKeepsDialerProxy(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	direct := newTestTailscale(t, TailscaleOption{StateDir: "tailscale/direct"})
+	if direct.DialerProxy() != "" {
+		t.Fatal("no dialer-proxy means direct")
+	}
+	conn, err := direct.server.SystemDialer(context.Background(), "tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("a node without dialer-proxy dials directly: %v", err)
+	}
+	_ = conn.Close()
+
+	via := newTestTailscale(t, TailscaleOption{
+		StateDir:    "tailscale/via",
+		BasicOption: BasicOption{DialerProxy: "missing-group"},
+	})
+	if via.DialerProxy() != "missing-group" {
+		t.Fatalf("DialerProxy() = %q", via.DialerProxy())
+	}
+	if conn, err := via.server.SystemDialer(context.Background(), "tcp", listener.Addr().String()); err == nil {
+		_ = conn.Close()
+		t.Fatal("a node with a dialer-proxy must not dial directly")
+	}
+}
+
+type fakePacketListener struct {
+	err   error
+	calls int
+}
+
+func (f *fakePacketListener) ListenPacket(ctx context.Context, network, address string, _ netip.AddrPort) (net.PacketConn, error) {
+	f.calls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	return net.ListenPacket("udp4", "127.0.0.1:0")
+}
+
+// A dialer-proxy that cannot carry UDP must not leave magicsock unable to
+// bind after a network change.
+func TestTailscalePacketListenerFallsBackToDirect(t *testing.T) {
+	failing := &fakePacketListener{err: errors.New("udp not supported")}
+	direct := &fakePacketListener{}
+	pc, err := listenPacketWithFallback(context.Background(), failing, "group", func() tailscalePacketListener { return direct }, "ts", "udp4", ":0")
+	if err != nil {
+		t.Fatalf("expected a direct socket, got %v", err)
+	}
+	_ = pc.Close()
+	if direct.calls != 1 {
+		t.Fatalf("direct listener calls = %d", direct.calls)
+	}
+
+	// Without a dialer-proxy the error stands: there is nothing to fall back to.
+	direct.calls = 0
+	if _, err := listenPacketWithFallback(context.Background(), failing, "", func() tailscalePacketListener { return direct }, "ts", "udp4", ":0"); err == nil || direct.calls != 0 {
+		t.Fatalf("no fallback expected, err=%v calls=%d", err, direct.calls)
+	}
+
+	// Both failing reports both.
+	if _, err := listenPacketWithFallback(context.Background(), failing, "group", func() tailscalePacketListener { return failing }, "ts", "udp4", ":0"); err == nil {
+		t.Fatal("expected an error when both fail")
+	}
+}
+
+// Through a real dialer-proxy that is missing, magicsock still gets a socket.
+func TestTailscaleSystemPacketListenerWithDialerProxy(t *testing.T) {
+	node := newTestTailscale(t, TailscaleOption{
+		StateDir:    "tailscale/udp",
+		BasicOption: BasicOption{DialerProxy: "missing-group"},
+	})
+	pc, err := node.server.SystemPacketListener(context.Background(), "udp4", ":0")
+	if err != nil {
+		t.Fatalf("magicsock must get a socket: %v", err)
+	}
+	_ = pc.Close()
 }

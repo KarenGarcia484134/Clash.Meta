@@ -159,7 +159,7 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 		},
 		SystemPacketListener: func(ctx context.Context, network, address string) (net.PacketConn, error) {
 			log.Debugln("[Tailscale](%s) SystemPacketListener: start listen %s %s", option.Name, network, address)
-			pc, err := outbound.dialer.ListenPacket(ctx, network, address, netip.AddrPort{})
+			pc, err := outbound.listenSystemPacket(ctx, network, address)
 			log.Debugln("[Tailscale](%s) SystemPacketListener: finish listen %s %s, err: %v", option.Name, network, address, err)
 			return pc, err
 		},
@@ -181,6 +181,37 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 	outbound.dnsResolver = dns.NewResolverFromClient(dnsTransport)
 	outbound.unregisterDNSResolver = dns.RegisterTailscaleDnsClient(option.Name, dnsTransport)
 	return outbound, nil
+}
+
+// tailscalePacketListener lets tests stand in for the dialers behind magicsock's
+// UDP sockets.
+type tailscalePacketListener interface {
+	ListenPacket(ctx context.Context, network, address string, rAddrPort netip.AddrPort) (net.PacketConn, error)
+}
+
+// listenSystemPacket opens a socket for magicsock. Through a dialer-proxy
+// that cannot carry UDP, or one with no destination yet to relay to, the
+// listen fails and every rebind after a network change ends in "failed to
+// bind any ports", leaving the node with no UDP at all. Fall back to a
+// direct socket then: it only carries peer-to-peer WireGuard and STUN, while
+// control and DERP still dial through the proxy over TCP.
+func (t *Tailscale) listenSystemPacket(ctx context.Context, network, address string) (net.PacketConn, error) {
+	return listenPacketWithFallback(ctx, t.dialer, t.option.DialerProxy, func() tailscalePacketListener {
+		return dialer.NewDialer(t.DialOptions()...)
+	}, t.Name(), network, address)
+}
+
+func listenPacketWithFallback(ctx context.Context, primary tailscalePacketListener, via string, direct func() tailscalePacketListener, name, network, address string) (net.PacketConn, error) {
+	pc, err := primary.ListenPacket(ctx, network, address, netip.AddrPort{})
+	if err == nil || via == "" {
+		return pc, err
+	}
+	log.Infoln("[Tailscale](%s) %s through %s failed (%v), using a direct UDP socket for peer traffic", name, network, via, err)
+	pc, directErr := direct().ListenPacket(ctx, network, address, netip.AddrPort{})
+	if directErr != nil {
+		return nil, fmt.Errorf("listen %s through %s: %w; directly: %v", network, via, err, directErr)
+	}
+	return pc, nil
 }
 
 func (t *Tailscale) start() error {
