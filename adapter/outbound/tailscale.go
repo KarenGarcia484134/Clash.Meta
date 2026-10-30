@@ -48,6 +48,8 @@ type Tailscale struct {
 
 	serverStarted bool
 
+	derpRoutes tailscaleDERPRoutes
+
 	unregisterDNSResolver func()
 }
 
@@ -153,7 +155,7 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 		Ephemeral:  option.Ephemeral,
 		SystemDialer: func(ctx context.Context, network, address string) (net.Conn, error) {
 			log.Debugln("[Tailscale](%s) SystemDialer: start dial %s %s", option.Name, network, address)
-			conn, err := outbound.dialer.DialContext(ctx, network, address)
+			conn, err := outbound.dialSystem(ctx, network, address)
 			log.Debugln("[Tailscale](%s) SystemDialer: finish dial %s %s, err: %v", option.Name, network, address, err)
 			return conn, err
 		},
@@ -230,6 +232,7 @@ func (t *Tailscale) start() error {
 			return
 		}
 		go t.watchBackendState()
+		go t.watchDERPMap()
 	})
 	return t.startErr
 }
