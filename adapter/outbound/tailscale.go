@@ -50,6 +50,9 @@ type Tailscale struct {
 
 	derpRoutes tailscaleDERPRoutes
 
+	exitNodeMu  sync.Mutex
+	exitNodeErr error
+
 	unregisterDNSResolver func()
 }
 
@@ -191,27 +194,32 @@ type tailscalePacketListener interface {
 	ListenPacket(ctx context.Context, network, address string, rAddrPort netip.AddrPort) (net.PacketConn, error)
 }
 
-// listenSystemPacket opens a socket for magicsock. Through a dialer-proxy
-// that cannot carry UDP, or one with no destination yet to relay to, the
-// listen fails and every rebind after a network change ends in "failed to
-// bind any ports", leaving the node with no UDP at all. Fall back to a
-// direct socket then: it only carries peer-to-peer WireGuard and STUN, while
-// control and DERP still dial through the proxy over TCP.
+// listenSystemPacket opens magicsock's UDP socket. Peer-to-peer WireGuard
+// and STUN are what make a direct path to a peer at all: through the
+// dialer-proxy, STUN learns the proxy's address and every "direct" path
+// detours through the proxy's country, if the proxy carries UDP at all
+// (one that cannot leaves every rebind with "failed to bind any ports").
+// So bind directly, with mihomo's dialer that on Android protects the
+// socket and binds it to the real network, and only fall back to the proxy
+// when that fails. Control and DERP still dial over TCP as before.
 func (t *Tailscale) listenSystemPacket(ctx context.Context, network, address string) (net.PacketConn, error) {
-	return listenPacketWithFallback(ctx, t.dialer, t.option.DialerProxy, func() tailscalePacketListener {
-		return dialer.NewDialer(t.DialOptions()...)
+	if t.option.DialerProxy == "" {
+		return t.dialer.ListenPacket(ctx, network, address, netip.AddrPort{})
+	}
+	return listenPacketWithFallback(ctx, dialer.NewDialer(t.DialOptions()...), t.option.DialerProxy, func() tailscalePacketListener {
+		return t.dialer
 	}, t.Name(), network, address)
 }
 
-func listenPacketWithFallback(ctx context.Context, primary tailscalePacketListener, via string, direct func() tailscalePacketListener, name, network, address string) (net.PacketConn, error) {
+func listenPacketWithFallback(ctx context.Context, primary tailscalePacketListener, via string, fallback func() tailscalePacketListener, name, network, address string) (net.PacketConn, error) {
 	pc, err := primary.ListenPacket(ctx, network, address, netip.AddrPort{})
 	if err == nil || via == "" {
 		return pc, err
 	}
-	log.Infoln("[Tailscale](%s) %s through %s failed (%v), using a direct UDP socket for peer traffic", name, network, via, err)
-	pc, directErr := direct().ListenPacket(ctx, network, address, netip.AddrPort{})
-	if directErr != nil {
-		return nil, fmt.Errorf("listen %s through %s: %w; directly: %v", network, via, err, directErr)
+	log.Infoln("[Tailscale](%s) direct %s socket failed (%v), using %s", name, network, err, via)
+	pc, viaErr := fallback().ListenPacket(ctx, network, address, netip.AddrPort{})
+	if viaErr != nil {
+		return nil, fmt.Errorf("listen %s directly: %w; through %s: %v", network, err, via, viaErr)
 	}
 	return pc, nil
 }
@@ -277,9 +285,11 @@ func (t *Tailscale) watchBackendState() {
 			}
 		}
 		if exitNodeNeedsStatus && *n.State == ipn.Running {
-			if err := t.applyExitNodePrefs(t.ctx); err != nil {
+			err := t.applyExitNodePrefs(t.ctx)
+			if err != nil {
 				log.Warnln("[Tailscale](%s) set exit node failed: %v", t.Name(), err)
 			}
+			t.setExitNodeErr(err)
 			return
 		}
 	}
