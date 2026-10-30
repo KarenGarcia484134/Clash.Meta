@@ -166,3 +166,51 @@ func (t *Tailscale) SameConfig(other *Tailscale) bool {
 func (t *Tailscale) Adopt() {
 	t.unregisterDNSResolver = dns.RegisterTailscaleDnsClient(t.option.Name, tailscaleDNSTransport{tailscale: t})
 }
+
+// DialerProxy names the proxy or group the node's own control, DERP and UDP
+// traffic goes through; empty means it dials directly.
+func (t *Tailscale) DialerProxy() string {
+	return t.option.DialerProxy
+}
+
+// TailscaleNeedsReconnect reports whether a started node is stuck without
+// getting anywhere on its own: logged out with no login URL to show, which
+// is where a failed control dial leaves a node that has a saved key.
+func TailscaleNeedsReconnect(state, authURL string) bool {
+	switch state {
+	case ipn.NeedsLogin.String():
+		return authURL == ""
+	case ipn.NoState.String(), ipn.Starting.String():
+		return true
+	}
+	return false
+}
+
+// Reconnect makes a stuck node log in again now instead of waiting out the
+// control client's backoff, as tailscale down and up would. The saved login
+// stays, so a node that was logged in comes back without a new login URL.
+func (t *Tailscale) Reconnect(ctx context.Context) error {
+	if !t.serverStarted {
+		return ErrTailscaleNotStarted
+	}
+	lc, err := t.server.LocalClient()
+	if err != nil {
+		return err
+	}
+	status, err := lc.StatusWithoutPeers(ctx)
+	if err != nil {
+		return err
+	}
+	if !TailscaleNeedsReconnect(status.BackendState, status.AuthURL) {
+		return nil
+	}
+	for _, want := range []bool{false, true} {
+		if _, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+			Prefs:          ipn.Prefs{WantRunning: want},
+			WantRunningSet: true,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
