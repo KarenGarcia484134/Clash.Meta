@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -311,7 +312,9 @@ func (t *Tailscale) dialSystem(ctx context.Context, network, address string) (ne
 }
 
 // watchDERPMap keeps the set of self-hosted DERP nodes in step with the
-// DERP map the control server sends.
+// DERP map the control server sends. Outside Windows the IPN bus carries a
+// NetMap only in the first message, sent before the node has logged in, so
+// the DERP map is read back through the LocalAPI on every later message.
 func (t *Tailscale) watchDERPMap() {
 	lc, err := t.server.LocalClient()
 	if err != nil {
@@ -322,13 +325,25 @@ func (t *Tailscale) watchDERPMap() {
 		return
 	}
 	defer watcher.Close()
+	var last *tailcfg.DERPMap
 	for {
 		n, err := watcher.Next()
 		if err != nil {
 			return
 		}
+		m := (*tailcfg.DERPMap)(nil)
 		if n.NetMap != nil {
-			t.derpRoutes.set(n.NetMap.DERPMap)
+			m = n.NetMap.DERPMap
 		}
+		if m == nil {
+			ctx, cancel := context.WithTimeout(t.ctx, 5*time.Second)
+			m, _ = lc.CurrentDERPMap(ctx)
+			cancel()
+		}
+		if m == nil || reflect.DeepEqual(m, last) {
+			continue
+		}
+		last = m
+		t.derpRoutes.set(m)
 	}
 }
