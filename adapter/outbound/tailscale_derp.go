@@ -14,6 +14,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/log"
@@ -86,7 +87,16 @@ type tailscaleDERPRoutes struct {
 	// proxied holds the open connections to self-hosted nodes that went
 	// through the proxy, to be closed once those nodes may dial directly.
 	proxied map[*trackedConn]string
+	// fallback holds connections to self-hosted nodes that went through
+	// the proxy only because the direct dial failed. They are re-probed
+	// and closed once a direct dial works again, so derphttp redials
+	// directly instead of staying on the proxy for the connection's life.
+	fallback map[*trackedConn]string
 }
+
+// derpDirectRetryInterval is how often a self-hosted DERP connection that
+// fell back to the proxy re-checks whether the direct path works again.
+var derpDirectRetryInterval = 30 * time.Second
 
 func derpRegionHosts(m *tailcfg.DERPMap) map[string]string {
 	hosts := map[string]string{}
@@ -197,8 +207,45 @@ type trackedConn struct {
 func (c *trackedConn) Close() error {
 	c.routes.mu.Lock()
 	delete(c.routes.proxied, c)
+	delete(c.routes.fallback, c)
 	c.routes.mu.Unlock()
 	return c.Conn.Close()
+}
+
+// trackFallback records a proxied connection to a self-hosted node and
+// starts re-probing the direct path. Once a direct dial succeeds the
+// proxied connection is closed so derphttp redials, now directly.
+func (r *tailscaleDERPRoutes) trackFallback(conn net.Conn, network, address string, direct func() tailscaleStreamDialer) net.Conn {
+	tracked := &trackedConn{Conn: conn, routes: r}
+	r.mu.Lock()
+	if r.fallback == nil {
+		r.fallback = map[*trackedConn]string{}
+	}
+	r.fallback[tracked] = address
+	r.mu.Unlock()
+	interval := derpDirectRetryInterval
+	go func() {
+		for {
+			time.Sleep(interval)
+			r.mu.Lock()
+			_, alive := r.fallback[tracked]
+			r.mu.Unlock()
+			if !alive {
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			probe, err := direct().DialContext(ctx, network, address)
+			cancel()
+			if err != nil {
+				continue
+			}
+			_ = probe.Close()
+			log.Infoln("[Tailscale] self-hosted DERP %s reachable directly again, redialing off the proxy", address)
+			_ = tracked.Close()
+			return
+		}
+	}()
+	return tracked
 }
 
 type tailscaleStreamDialer interface {
@@ -219,7 +266,16 @@ func dialSystemVia(ctx context.Context, routes *tailscaleDERPRoutes, primary tai
 		return conn, err
 	}
 	if routes.direct(address) {
-		conn, err := direct().DialContext(ctx, network, address)
+		// derphttp gives each node only a short deadline; leave half of
+		// it for the proxy fallback instead of letting a hanging direct
+		// dial eat all of it.
+		directCtx := ctx
+		if deadline, ok := ctx.Deadline(); ok {
+			var cancel context.CancelFunc
+			directCtx, cancel = context.WithTimeout(ctx, time.Until(deadline)/2)
+			defer cancel()
+		}
+		conn, err := direct().DialContext(directCtx, network, address)
 		if err == nil {
 			log.Infoln("[Tailscale](%s) self-hosted DERP %s dialed directly", name, address)
 			return routes.record(address, TailscaleRouteDirect, conn), nil
@@ -229,9 +285,8 @@ func dialSystemVia(ctx context.Context, routes *tailscaleDERPRoutes, primary tai
 		if err != nil {
 			return nil, err
 		}
-		// Not tracked: it went through the proxy because direct failed.
 		routes.record(address, TailscaleRouteProxy, nil)
-		return conn, nil
+		return routes.trackFallback(conn, network, address, direct), nil
 	}
 	conn, err := primary.DialContext(ctx, network, address)
 	if err != nil {

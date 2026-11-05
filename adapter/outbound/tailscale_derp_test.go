@@ -6,7 +6,9 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/metacubex/tailscale/tailcfg"
 )
@@ -165,3 +167,56 @@ func TestDERPConnDialedBeforeTheMapIsRedialedDirectly(t *testing.T) {
 		t.Fatalf("routes = %v", got)
 	}
 }
+
+type toggleStreamDialer struct {
+	mu   sync.Mutex
+	fail bool
+}
+
+func (f *toggleStreamDialer) DialContext(context.Context, string, string) (net.Conn, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail {
+		return nil, errors.New("direct down")
+	}
+	a, b := net.Pipe()
+	_ = b.Close()
+	return a, nil
+}
+
+// A self-hosted DERP connection that fell back to the proxy must not stay
+// there once the direct path works again.
+func TestDialSystemFallbackReturnsToDirect(t *testing.T) {
+	old := derpDirectRetryInterval
+	derpDirectRetryInterval = 20 * time.Millisecond
+	defer func() { derpDirectRetryInterval = old }()
+
+	var routes tailscaleDERPRoutes
+	routes.set(testDERPMap())
+	direct := &toggleStreamDialer{fail: true}
+	proxyA, proxyB := net.Pipe()
+	defer proxyB.Close()
+	proxy := streamDialerFunc(func() (net.Conn, error) { return proxyA, nil })
+	conn, err := dialSystemVia(context.Background(), &routes, proxy, "group",
+		func() tailscaleStreamDialer { return direct }, "ts", "tcp", "203.0.113.7:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	direct.mu.Lock()
+	direct.fail = false
+	direct.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() { _, _ = proxyB.Read(make([]byte, 1)); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("proxied fallback connection to self-hosted DERP was never closed after direct recovered")
+	}
+}
+
+type streamDialerFunc func() (net.Conn, error)
+
+func (f streamDialerFunc) DialContext(context.Context, string, string) (net.Conn, error) { return f() }
