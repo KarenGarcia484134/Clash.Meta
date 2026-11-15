@@ -1,20 +1,24 @@
 //go:build with_gvisor && !no_tailscale
 
-// FlClash patch: a self-hosted DERP server is usually close to its users,
-// often in the same country, and dialing it through the node's
-// dialer-proxy sends every relayed packet abroad and back. Dial those
-// directly and keep Tailscale's own DERP servers and control on the proxy.
+// FlClash patch: the dialer-proxy exists so the node can reach the control
+// server, but magicsock binds UDP directly and so picks the DERP region
+// closest to the device; relaying that region's traffic through the proxy
+// sends every packet abroad and back. Dial every DERP node, Tailscale's own
+// included, directly first, and keep control on the proxy.
 // Kept in its own file so syncing with upstream never conflicts.
 
 package outbound
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
+	"net/netip"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/component/dialer"
@@ -23,108 +27,56 @@ import (
 	"github.com/metacubex/tailscale/tailcfg"
 )
 
-// tailscaleOfficialDERPSuffix is where every DERP server Tailscale runs
-// lives. Anything else in the DERP map is the tailnet's own.
-const tailscaleOfficialDERPSuffix = ".tailscale.com"
-
-// isCustomDERPNode reports whether n is not one of Tailscale's own servers.
-func isCustomDERPNode(n *tailcfg.DERPNode) bool {
-	if n == nil {
-		return false
-	}
-	host := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(n.HostName)), ".")
-	return host != "" && !strings.HasSuffix(host, tailscaleOfficialDERPSuffix)
-}
-
-// customDERPHosts lists the hostnames and addresses derphttp may dial for
-// the self-hosted nodes in m. A region with a self-hosted node counts as
-// custom as a whole, since its other nodes are the tailnet's too.
-func customDERPHosts(m *tailcfg.DERPMap) map[string]bool {
-	hosts := map[string]bool{}
-	if m == nil {
-		return hosts
-	}
-	for _, region := range m.Regions {
-		if region == nil {
-			continue
-		}
-		custom := false
-		for _, n := range region.Nodes {
-			if isCustomDERPNode(n) {
-				custom = true
-				break
-			}
-		}
-		if !custom {
-			continue
-		}
-		for _, n := range region.Nodes {
-			if n == nil {
-				continue
-			}
-			for _, host := range []string{n.HostName, n.IPv4, n.IPv6} {
-				host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
-				if host != "" && host != "none" {
-					hosts[host] = true
-				}
-			}
-		}
-	}
-	return hosts
-}
-
 // Route names reported for a DERP region.
 const (
 	TailscaleRouteDirect = "direct"
 	TailscaleRouteProxy  = "proxy"
 )
 
+// derpNodeHost is what is known about one host or address derphttp may dial.
+type derpNodeHost struct {
+	region     string
+	serverName string
+	// hasIPv4 means derphttp races a tcp4 dial for the same node, which
+	// makes a failed tcp6 one safe to drop instead of proxying.
+	hasIPv4 bool
+}
+
+// derpDirectHealth backs a direct path off after it fails. A TCP connect is
+// not proof enough: a filter that matches the TLS SNI lets the connect
+// through and resets the handshake, and each redial would hit it again.
+type derpDirectHealth struct {
+	failures int
+	until    time.Time
+}
+
 type tailscaleDERPRoutes struct {
-	mu     sync.Mutex
-	custom map[string]bool
-	region map[string]string // host -> region code, for every DERP node
+	mu    sync.Mutex
+	hosts map[string]derpNodeHost
 	// route is how each region's DERP connection was last dialed.
 	route map[string]string
-	// proxied holds the open connections to self-hosted nodes that went
-	// through the proxy, to be closed once those nodes may dial directly.
+	// proxied holds the open proxied connections to hosts not yet known
+	// as DERP nodes, to be closed once the map shows they are.
 	proxied map[*trackedConn]string
-	// fallback holds connections to self-hosted nodes that went through
-	// the proxy only because the direct dial failed. They are re-probed
-	// and closed once a direct dial works again, so derphttp redials
-	// directly instead of staying on the proxy for the connection's life.
+	// fallback holds the DERP connections that went through the proxy
+	// because the direct path failed; each is re-probed and closed once a
+	// direct handshake works again, so derphttp redials directly.
 	fallback map[*trackedConn]string
+	health   map[string]*derpDirectHealth
 }
 
-// derpDirectRetryInterval is how often a self-hosted DERP connection that
-// fell back to the proxy re-checks whether the direct path works again.
-var derpDirectRetryInterval = 30 * time.Second
-
-func derpRegionHosts(m *tailcfg.DERPMap) map[string]string {
-	hosts := map[string]string{}
-	if m == nil {
-		return hosts
-	}
-	for id, region := range m.Regions {
-		if region == nil {
-			continue
-		}
-		code := region.RegionCode
-		if code == "" {
-			code = fmt.Sprint(id)
-		}
-		for _, n := range region.Nodes {
-			if n == nil {
-				continue
-			}
-			for _, host := range []string{n.HostName, n.IPv4, n.IPv6} {
-				if host = normalizeDERPHost(host); host != "" && host != "none" {
-					hosts[host] = code
-				}
-			}
-		}
-	}
-	return hosts
-}
+var (
+	// derpDirectRetryInterval is how often a DERP connection that fell back
+	// to the proxy re-checks whether the direct path works again.
+	derpDirectRetryInterval = 30 * time.Second
+	derpDirectBackoffBase   = time.Minute
+	derpDirectBackoffMax    = 15 * time.Minute
+	// A direct connection that has read something and is still open this
+	// long clears its path's backoff. One that wrote and ends without
+	// reading a byte failed: that is how a reset handshake looks.
+	derpDirectHealthyAfter = 10 * time.Second
+	derpDirectProbe        = probeDERPHandshake
+)
 
 func normalizeDERPHost(host string) string {
 	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
@@ -138,19 +90,55 @@ func derpHostOf(address string) string {
 	return normalizeDERPHost(host)
 }
 
+func derpNodeHosts(m *tailcfg.DERPMap) map[string]derpNodeHost {
+	hosts := map[string]derpNodeHost{}
+	if m == nil {
+		return hosts
+	}
+	for id, region := range m.Regions {
+		if region == nil {
+			continue
+		}
+		code := region.RegionCode
+		if code == "" {
+			code = fmt.Sprint(id)
+		}
+		for _, n := range region.Nodes {
+			if n == nil || n.STUNOnly {
+				continue
+			}
+			v4 := strings.TrimSpace(n.IPv4)
+			info := derpNodeHost{
+				region:     code,
+				serverName: strings.TrimSuffix(strings.TrimSpace(n.HostName), "."),
+				hasIPv4:    v4 == "" || isIPv4Literal(v4),
+			}
+			for _, host := range []string{n.HostName, n.IPv4, n.IPv6} {
+				if host = normalizeDERPHost(host); host != "" && host != "none" {
+					hosts[host] = info
+				}
+			}
+		}
+	}
+	return hosts
+}
+
+func isIPv4Literal(s string) bool {
+	ip, err := netip.ParseAddr(s)
+	return err == nil && ip.Is4()
+}
+
 // set takes a new DERP map. The node dials its home DERP as soon as it has
 // a map, often one cached from the last run, before the netmap reaches this
-// watcher; such a connection to a self-hosted node went through the proxy
-// and would stay there. Close it so derphttp redials, now directly.
+// watcher; such a connection went through the proxy and would stay there.
+// Close it so derphttp redials, now directly.
 func (r *tailscaleDERPRoutes) set(m *tailcfg.DERPMap) {
-	hosts := customDERPHosts(m)
-	regions := derpRegionHosts(m)
+	hosts := derpNodeHosts(m)
 	var stale []*trackedConn
 	r.mu.Lock()
-	r.custom = hosts
-	r.region = regions
+	r.hosts = hosts
 	for conn, host := range r.proxied {
-		if hosts[host] {
+		if _, ok := hosts[host]; ok {
 			stale = append(stale, conn)
 			delete(r.proxied, conn)
 		}
@@ -161,31 +149,82 @@ func (r *tailscaleDERPRoutes) set(m *tailcfg.DERPMap) {
 	}
 }
 
-// direct reports whether address belongs to a self-hosted DERP node.
-func (r *tailscaleDERPRoutes) direct(address string) bool {
+func (r *tailscaleDERPRoutes) node(address string) (derpNodeHost, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.custom[derpHostOf(address)]
+	info, ok := r.hosts[derpHostOf(address)]
+	return info, ok
 }
 
-func (r *tailscaleDERPRoutes) record(address, route string, conn net.Conn) net.Conn {
-	host := derpHostOf(address)
+func derpHealthKey(network, address string) string {
+	return network + "|" + derpHostOf(address)
+}
+
+// directAllowed reports whether the direct path to address is out of its
+// backoff.
+func (r *tailscaleDERPRoutes) directAllowed(key string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if code, ok := r.region[host]; ok {
-		if r.route == nil {
-			r.route = map[string]string{}
-		}
-		r.route[code] = route
+	h := r.health[key]
+	return h == nil || !time.Now().Before(h.until)
+}
+
+func (r *tailscaleDERPRoutes) directFailed(key string) time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.health == nil {
+		r.health = map[string]*derpDirectHealth{}
 	}
-	if route != TailscaleRouteProxy || conn == nil {
-		return conn
+	h := r.health[key]
+	if h == nil {
+		h = &derpDirectHealth{}
+		r.health[key] = h
 	}
+	backoff := derpDirectBackoffBase
+	for i := 0; i < h.failures && backoff < derpDirectBackoffMax; i++ {
+		backoff *= 2
+	}
+	if backoff > derpDirectBackoffMax {
+		backoff = derpDirectBackoffMax
+	}
+	h.failures++
+	h.until = time.Now().Add(backoff)
+	return backoff
+}
+
+func (r *tailscaleDERPRoutes) directHealthy(key string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.health, key)
+}
+
+// resetHealth forgets every failed direct path, which says nothing about
+// the network the device has just joined.
+func (r *tailscaleDERPRoutes) resetHealth() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.health = nil
+}
+
+func (r *tailscaleDERPRoutes) recordRoute(region, route string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.route == nil {
+		r.route = map[string]string{}
+	}
+	r.route[region] = route
+}
+
+// trackProxied records a proxied connection to a host not known as a DERP
+// node, which set closes if the map later shows it is one.
+func (r *tailscaleDERPRoutes) trackProxied(address string, conn net.Conn) net.Conn {
 	tracked := &trackedConn{Conn: conn, routes: r}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.proxied == nil {
 		r.proxied = map[*trackedConn]string{}
 	}
-	r.proxied[tracked] = host
+	r.proxied[tracked] = derpHostOf(address)
 	return tracked
 }
 
@@ -213,10 +252,84 @@ func (c *trackedConn) Close() error {
 	return c.Conn.Close()
 }
 
-// trackFallback records a proxied connection to a self-hosted node and
-// starts re-probing the direct path. Once a direct dial succeeds the
+// directDERPConn judges a direct DERP connection by how it ends. derphttp
+// closes the connection when the TLS handshake or the upgrade fails, and a
+// loser of its IPv4/IPv6 race is closed before anything was written.
+type directDERPConn struct {
+	net.Conn
+	routes  *tailscaleDERPRoutes
+	key     string
+	address string
+	opened  time.Time
+	wrote   atomic.Bool
+	read    atomic.Bool
+	once    sync.Once
+	healthy *time.Timer
+}
+
+func (r *tailscaleDERPRoutes) watchDirect(conn net.Conn, key, address string) net.Conn {
+	c := &directDERPConn{Conn: conn, routes: r, key: key, address: address, opened: time.Now()}
+	c.healthy = time.AfterFunc(derpDirectHealthyAfter, func() {
+		if c.read.Load() {
+			r.directHealthy(key)
+		}
+	})
+	return c
+}
+
+func (c *directDERPConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 {
+		c.read.Store(true)
+	}
+	return n, err
+}
+
+func (c *directDERPConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if n > 0 {
+		c.wrote.Store(true)
+	}
+	return n, err
+}
+
+func (c *directDERPConn) Close() error {
+	c.once.Do(func() {
+		c.healthy.Stop()
+		if !c.wrote.Load() {
+			return
+		}
+		if c.read.Load() {
+			if time.Since(c.opened) >= derpDirectHealthyAfter {
+				c.routes.directHealthy(c.key)
+			}
+			return
+		}
+		backoff := c.routes.directFailed(c.key)
+		log.Infoln("[Tailscale] direct DERP connection to %s ended early, using the proxy for %v", c.address, backoff)
+	})
+	return c.Conn.Close()
+}
+
+// probeDERPHandshake checks that a TLS handshake to the node completes,
+// which a TCP connect alone does not show. The certificate is derphttp's to
+// verify; the probe only asks whether the path carries the handshake.
+func probeDERPHandshake(ctx context.Context, conn net.Conn, serverName string) error {
+	if serverName == "" {
+		return nil
+	}
+	tlsConn := tls.Client(conn, &tls.Config{
+		ServerName:         serverName,
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"http/1.1"},
+	})
+	return tlsConn.HandshakeContext(ctx)
+}
+
+// trackFallback records a proxied DERP connection and re-probes the direct
+// path once its backoff is over. Once a direct handshake succeeds the
 // proxied connection is closed so derphttp redials, now directly.
-func (r *tailscaleDERPRoutes) trackFallback(conn net.Conn, network, address string, direct func() tailscaleStreamDialer) net.Conn {
+func (r *tailscaleDERPRoutes) trackFallback(conn net.Conn, network, address, key, serverName string, direct func() tailscaleStreamDialer) net.Conn {
 	tracked := &trackedConn{Conn: conn, routes: r}
 	r.mu.Lock()
 	if r.fallback == nil {
@@ -234,14 +347,21 @@ func (r *tailscaleDERPRoutes) trackFallback(conn net.Conn, network, address stri
 			if !alive {
 				return
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			probe, err := direct().DialContext(ctx, network, address)
-			cancel()
-			if err != nil {
+			if !r.directAllowed(key) {
 				continue
 			}
-			_ = probe.Close()
-			log.Infoln("[Tailscale] self-hosted DERP %s reachable directly again, redialing off the proxy", address)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			probe, err := direct().DialContext(ctx, network, address)
+			if err == nil {
+				err = derpDirectProbe(ctx, probe, serverName)
+				_ = probe.Close()
+			}
+			cancel()
+			if err != nil {
+				r.directFailed(key)
+				continue
+			}
+			log.Infoln("[Tailscale] DERP %s reachable directly again, redialing off the proxy", address)
 			_ = tracked.Close()
 			return
 		}
@@ -253,20 +373,31 @@ type tailscaleStreamDialer interface {
 	DialContext(ctx context.Context, network, address string) (net.Conn, error)
 }
 
-// dialSystemVia dials a self-hosted DERP node directly, falling back to the
-// proxy when the direct dial fails, and everything else through primary.
+// dialSystemVia dials a DERP node directly, falling back to the proxy when
+// the direct path fails, and everything else through primary.
 func dialSystemVia(ctx context.Context, routes *tailscaleDERPRoutes, primary tailscaleStreamDialer, via string, direct func() tailscaleStreamDialer, name, network, address string) (net.Conn, error) {
 	if routes == nil {
 		return primary.DialContext(ctx, network, address)
 	}
+	node, isDERP := routes.node(address)
 	if via == "" {
 		conn, err := primary.DialContext(ctx, network, address)
-		if err == nil {
-			conn = routes.record(address, TailscaleRouteDirect, conn)
+		if err == nil && isDERP {
+			routes.recordRoute(node.region, TailscaleRouteDirect)
 		}
 		return conn, err
 	}
-	if routes.direct(address) {
+	if !isDERP {
+		conn, err := primary.DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		return routes.trackProxied(address, conn), nil
+	}
+
+	key := derpHealthKey(network, address)
+	var directErr error
+	if routes.directAllowed(key) {
 		// derphttp gives each node only a short deadline; leave half of
 		// it for the proxy fallback instead of letting a hanging direct
 		// dial eat all of it.
@@ -278,22 +409,33 @@ func dialSystemVia(ctx context.Context, routes *tailscaleDERPRoutes, primary tai
 		}
 		conn, err := direct().DialContext(directCtx, network, address)
 		if err == nil {
-			log.Infoln("[Tailscale](%s) self-hosted DERP %s dialed directly", name, address)
-			return routes.record(address, TailscaleRouteDirect, conn), nil
+			log.Debugln("[Tailscale](%s) DERP %s dialed directly", name, address)
+			routes.recordRoute(node.region, TailscaleRouteDirect)
+			return routes.watchDirect(conn, key, address), nil
 		}
-		log.Infoln("[Tailscale](%s) direct dial to self-hosted DERP %s failed (%v), using %s", name, address, err, via)
-		conn, err = primary.DialContext(ctx, network, address)
-		if err != nil {
+		// The losing dial of derphttp's race is cancelled, which is not
+		// the path's fault.
+		if ctx.Err() != nil {
 			return nil, err
 		}
-		routes.record(address, TailscaleRouteProxy, nil)
-		return routes.trackFallback(conn, network, address, direct), nil
+		directErr = err
+		backoff := routes.directFailed(key)
+		log.Infoln("[Tailscale](%s) direct dial to DERP %s failed (%v), using %s for %v", name, address, err, via, backoff)
+	}
+	// The tcp4 dial derphttp races beside this one takes the proxy if it
+	// must; two proxied dials would only race each other.
+	if network == "tcp6" && node.hasIPv4 {
+		if directErr == nil {
+			directErr = fmt.Errorf("direct IPv6 path to %s is backing off", address)
+		}
+		return nil, directErr
 	}
 	conn, err := primary.DialContext(ctx, network, address)
 	if err != nil {
 		return nil, err
 	}
-	return routes.record(address, TailscaleRouteProxy, conn), nil
+	routes.recordRoute(node.region, TailscaleRouteProxy)
+	return routes.trackFallback(conn, network, address, key, node.serverName, direct), nil
 }
 
 // DERPRoutes reports, by region code, whether the node's DERP connection to
@@ -311,10 +453,10 @@ func (t *Tailscale) dialSystem(ctx context.Context, network, address string) (ne
 	}, t.Name(), network, address)
 }
 
-// watchDERPMap keeps the set of self-hosted DERP nodes in step with the
-// DERP map the control server sends. Outside Windows the IPN bus carries a
-// NetMap only in the first message, sent before the node has logged in, so
-// the DERP map is read back through the LocalAPI on every later message.
+// watchDERPMap keeps the set of DERP nodes in step with the DERP map the
+// control server sends. Outside Windows the IPN bus carries a NetMap only in
+// the first message, sent before the node has logged in, so the DERP map is
+// read back through the LocalAPI on every later message.
 func (t *Tailscale) watchDERPMap() {
 	lc, err := t.server.LocalClient()
 	if err != nil {

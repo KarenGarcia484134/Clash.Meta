@@ -115,6 +115,7 @@ func (t *Tailscale) WaitSettled(ctx context.Context) (state, authURL string, err
 // switch broke, rebinds magicsock and reconnects DERP and control; the node
 // and its login stay as they are.
 func (t *Tailscale) NetworkChanged() {
+	t.derpRoutes.resetHealth()
 	if !t.serverStarted || t.server == nil {
 		return
 	}
