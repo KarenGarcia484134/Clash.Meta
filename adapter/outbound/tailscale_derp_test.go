@@ -423,3 +423,62 @@ func TestFallbackProbeNeedsAHandshake(t *testing.T) {
 		t.Fatalf("a failed probe must back the path off further, failures=%d", failures)
 	}
 }
+
+func TestDERPConnBecomingKnownDuringProxyDialSwitchesToDirect(t *testing.T) {
+	var routes tailscaleDERPRoutes
+	direct := &fakeStreamDialer{}
+	var proxyCalls int
+	proxy := streamDialerFunc(func() (net.Conn, error) {
+		proxyCalls++
+		// Simulate the DERP map arriving while the proxied dial was in flight.
+		routes.set(testDERPMap())
+		a, b := net.Pipe()
+		_ = b.Close()
+		return a, nil
+	})
+	conn, err := dialSystemVia(context.Background(), &routes, proxy, "group",
+		func() tailscaleStreamDialer { return direct }, "ts", "tcp", "203.0.113.7:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	if proxyCalls != 1 || len(direct.calls) != 1 {
+		t.Fatalf("expected concurrent DERP map arrival to re-dial directly: proxy=%d direct=%v", proxyCalls, direct.calls)
+	}
+	if got := routes.Routes()["tx-cd-derp"]; got != TailscaleRouteDirect {
+		t.Fatalf("route = %q, want direct", got)
+	}
+}
+
+func TestFallbackProbeStopsOnCloseAll(t *testing.T) {
+	interval, base, probe := derpDirectRetryInterval, derpDirectBackoffBase, derpDirectProbe
+	derpDirectRetryInterval = 20 * time.Millisecond
+	derpDirectBackoffBase = 10 * time.Millisecond
+	var probeCalls atomic.Int32
+	derpDirectProbe = func(context.Context, net.Conn, string) error {
+		probeCalls.Add(1)
+		return errors.New("still blocked")
+	}
+	t.Cleanup(func() {
+		derpDirectRetryInterval, derpDirectBackoffBase, derpDirectProbe = interval, base, probe
+	})
+
+	var routes tailscaleDERPRoutes
+	routes.set(testDERPMap())
+	direct := &toggleStreamDialer{fail: true}
+	proxyA, proxyB := net.Pipe()
+	defer proxyB.Close()
+	proxy := streamDialerFunc(func() (net.Conn, error) { return proxyA, nil })
+	conn, err := dialSystemVia(context.Background(), &routes, proxy, "group",
+		func() tailscaleStreamDialer { return direct }, "ts", "tcp4", "1.1.1.4:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn
+	routes.closeAll()
+	after := probeCalls.Load()
+	time.Sleep(80 * time.Millisecond)
+	if probeCalls.Load() != after {
+		t.Fatalf("fallback probe continued after closeAll: %d -> %d", after, probeCalls.Load())
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/component/ca"
@@ -46,7 +47,7 @@ type Tailscale struct {
 	backendInitCh   chan struct{}
 	backendInitErr  error
 
-	serverStarted bool
+	serverStarted atomic.Bool
 
 	derpRoutes tailscaleDERPRoutes
 
@@ -231,7 +232,7 @@ func (t *Tailscale) start() error {
 			t.setBackendInitialized(err)
 			return
 		}
-		t.serverStarted = true
+		t.serverStarted.Store(true)
 		ctx, cancel := context.WithTimeout(t.ctx, 30*time.Second)
 		defer cancel()
 		if err := t.applyPrefs(ctx); err != nil {
@@ -288,8 +289,10 @@ func (t *Tailscale) watchBackendState() {
 			err := t.applyExitNodePrefs(t.ctx)
 			if err != nil {
 				log.Warnln("[Tailscale](%s) set exit node failed: %v", t.Name(), err)
+				t.setExitNodeErr(err)
+				continue
 			}
-			t.setExitNodeErr(err)
+			t.setExitNodeErr(nil)
 			return
 		}
 	}
@@ -510,13 +513,14 @@ func (t *Tailscale) IsL3Protocol(metadata *C.Metadata) bool {
 
 func (t *Tailscale) Close() error {
 	t.cancel()
+	t.derpRoutes.closeAll()
 	if t.unregisterDNSResolver != nil {
 		t.unregisterDNSResolver()
 	}
 	t.startOnce.Do(func() {
 		t.startErr = errors.New("tailscale outbound closed")
 	})
-	if t.server != nil && t.serverStarted { // tsnet.Server.Close() must not be called before or concurrently with Start.
+	if t.server != nil && t.serverStarted.Load() { // tsnet.Server.Close() must not be called before or concurrently with Start.
 		return t.server.Close()
 	}
 	return nil
