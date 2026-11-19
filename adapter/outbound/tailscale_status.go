@@ -39,7 +39,7 @@ func UnwrapTailscale(adapter C.ProxyAdapter) (*Tailscale, bool) {
 
 // Started reports whether the node has been brought up by a dial or Start.
 func (t *Tailscale) Started() bool {
-	return t.serverStarted
+	return t.serverStarted.Load()
 }
 
 // Start brings the node up without waiting for traffic to need it.
@@ -49,7 +49,7 @@ func (t *Tailscale) Start(ctx context.Context) error {
 
 // Status returns the node's view of the tailnet, including its peers.
 func (t *Tailscale) Status(ctx context.Context) (*ipnstate.Status, error) {
-	if !t.serverStarted {
+	if !t.serverStarted.Load() {
 		return nil, ErrTailscaleNotStarted
 	}
 	lc, err := t.server.LocalClient()
@@ -76,7 +76,7 @@ func TailscaleSettled(state, authURL string) bool {
 // WaitSettled follows the IPN bus until the node settles or ctx ends, and
 // returns the last state and login URL it saw.
 func (t *Tailscale) WaitSettled(ctx context.Context) (state, authURL string, err error) {
-	if !t.serverStarted {
+	if !t.serverStarted.Load() {
 		return "", "", ErrTailscaleNotStarted
 	}
 	lc, err := t.server.LocalClient()
@@ -116,7 +116,7 @@ func (t *Tailscale) WaitSettled(ctx context.Context) (state, authURL string, err
 // and its login stay as they are.
 func (t *Tailscale) NetworkChanged() {
 	t.derpRoutes.resetHealth()
-	if !t.serverStarted || t.server == nil {
+	if !t.serverStarted.Load() || t.server == nil {
 		return
 	}
 	sys := t.server.Sys()
@@ -131,7 +131,7 @@ func (t *Tailscale) NetworkChanged() {
 // Ping sends one ping of pingType to ip through the node. A disco ping also
 // tells whether the path is direct or through a relay.
 func (t *Tailscale) Ping(ctx context.Context, ip netip.Addr, pingType tailcfg.PingType) (*ipnstate.PingResult, error) {
-	if !t.serverStarted {
+	if !t.serverStarted.Load() {
 		return nil, ErrTailscaleNotStarted
 	}
 	lc, err := t.server.LocalClient()
@@ -191,7 +191,7 @@ func TailscaleNeedsReconnect(state, authURL string) bool {
 // control client's backoff, as tailscale down and up would. The saved login
 // stays, so a node that was logged in comes back without a new login URL.
 func (t *Tailscale) Reconnect(ctx context.Context) error {
-	if !t.serverStarted {
+	if !t.serverStarted.Load() {
 		return ErrTailscaleNotStarted
 	}
 	lc, err := t.server.LocalClient()

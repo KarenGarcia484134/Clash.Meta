@@ -63,6 +63,9 @@ type tailscaleDERPRoutes struct {
 	// direct handshake works again, so derphttp redials directly.
 	fallback map[*trackedConn]string
 	health   map[string]*derpDirectHealth
+	closed   bool
+	probeCtx context.Context
+	cancel   context.CancelFunc
 }
 
 var (
@@ -145,7 +148,28 @@ func (r *tailscaleDERPRoutes) set(m *tailcfg.DERPMap) {
 	}
 	r.mu.Unlock()
 	for _, conn := range stale {
-		_ = conn.Conn.Close()
+		_ = conn.Close()
+	}
+}
+
+func (r *tailscaleDERPRoutes) closeAll() {
+	r.mu.Lock()
+	r.closed = true
+	if r.cancel != nil {
+		r.cancel()
+	}
+	conns := make([]*trackedConn, 0, len(r.proxied)+len(r.fallback))
+	for conn := range r.proxied {
+		conns = append(conns, conn)
+	}
+	r.proxied = nil
+	for conn := range r.fallback {
+		conns = append(conns, conn)
+	}
+	r.fallback = nil
+	r.mu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
 	}
 }
 
@@ -216,16 +240,24 @@ func (r *tailscaleDERPRoutes) recordRoute(region, route string) {
 }
 
 // trackProxied records a proxied connection to a host not known as a DERP
-// node, which set closes if the map later shows it is one.
-func (r *tailscaleDERPRoutes) trackProxied(address string, conn net.Conn) net.Conn {
-	tracked := &trackedConn{Conn: conn, routes: r}
+// node, which set closes if the map later shows it is one. If a concurrent map
+// update already marked the host as a DERP node, it reports becameDERP=true.
+func (r *tailscaleDERPRoutes) trackProxied(address string, conn net.Conn) (net.Conn, derpNodeHost, bool) {
+	host := derpHostOf(address)
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.proxied == nil {
-		r.proxied = map[*trackedConn]string{}
+	if info, isDERP := r.hosts[host]; isDERP {
+		r.mu.Unlock()
+		return nil, info, true
 	}
-	r.proxied[tracked] = derpHostOf(address)
-	return tracked
+	tracked := newTrackedConn(conn, r)
+	if !r.closed {
+		if r.proxied == nil {
+			r.proxied = map[*trackedConn]string{}
+		}
+		r.proxied[tracked] = host
+	}
+	r.mu.Unlock()
+	return tracked, derpNodeHost{}, false
 }
 
 // Routes returns how each DERP region was last dialed, by region code.
@@ -242,9 +274,22 @@ func (r *tailscaleDERPRoutes) Routes() map[string]string {
 type trackedConn struct {
 	net.Conn
 	routes *tailscaleDERPRoutes
+	once   sync.Once
+	closed chan struct{}
+}
+
+func newTrackedConn(conn net.Conn, routes *tailscaleDERPRoutes) *trackedConn {
+	return &trackedConn{
+		Conn:   conn,
+		routes: routes,
+		closed: make(chan struct{}),
+	}
 }
 
 func (c *trackedConn) Close() error {
+	c.once.Do(func() {
+		close(c.closed)
+	})
 	c.routes.mu.Lock()
 	delete(c.routes.proxied, c)
 	delete(c.routes.fallback, c)
@@ -330,17 +375,33 @@ func probeDERPHandshake(ctx context.Context, conn net.Conn, serverName string) e
 // path once its backoff is over. Once a direct handshake succeeds the
 // proxied connection is closed so derphttp redials, now directly.
 func (r *tailscaleDERPRoutes) trackFallback(conn net.Conn, network, address, key, serverName string, direct func() tailscaleStreamDialer) net.Conn {
-	tracked := &trackedConn{Conn: conn, routes: r}
+	tracked := newTrackedConn(conn, r)
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return tracked
+	}
 	if r.fallback == nil {
 		r.fallback = map[*trackedConn]string{}
 	}
 	r.fallback[tracked] = address
+	if r.probeCtx == nil {
+		r.probeCtx, r.cancel = context.WithCancel(context.Background())
+	}
+	baseCtx := r.probeCtx
 	r.mu.Unlock()
 	interval := derpDirectRetryInterval
 	go func() {
+		timer := time.NewTimer(interval)
+		defer timer.Stop()
 		for {
-			time.Sleep(interval)
+			select {
+			case <-timer.C:
+			case <-tracked.closed:
+				return
+			case <-baseCtx.Done():
+				return
+			}
 			r.mu.Lock()
 			_, alive := r.fallback[tracked]
 			r.mu.Unlock()
@@ -348,17 +409,22 @@ func (r *tailscaleDERPRoutes) trackFallback(conn net.Conn, network, address, key
 				return
 			}
 			if !r.directAllowed(key) {
+				timer.Reset(interval)
 				continue
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(baseCtx, 5*time.Second)
 			probe, err := direct().DialContext(ctx, network, address)
 			if err == nil {
 				err = derpDirectProbe(ctx, probe, serverName)
 				_ = probe.Close()
 			}
 			cancel()
+			if baseCtx.Err() != nil {
+				return
+			}
 			if err != nil {
 				r.directFailed(key)
+				timer.Reset(interval)
 				continue
 			}
 			log.Infoln("[Tailscale] DERP %s reachable directly again, redialing off the proxy", address)
@@ -392,7 +458,15 @@ func dialSystemVia(ctx context.Context, routes *tailscaleDERPRoutes, primary tai
 		if err != nil {
 			return nil, err
 		}
-		return routes.trackProxied(address, conn), nil
+		tracked, derpNode, becameDERP := routes.trackProxied(address, conn)
+		if !becameDERP {
+			return tracked, nil
+		}
+		_ = conn.Close()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		node = derpNode
 	}
 
 	key := derpHealthKey(network, address)
