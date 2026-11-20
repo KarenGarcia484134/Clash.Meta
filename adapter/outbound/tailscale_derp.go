@@ -71,9 +71,11 @@ type tailscaleDERPRoutes struct {
 var (
 	// derpDirectRetryInterval is how often a DERP connection that fell back
 	// to the proxy re-checks whether the direct path works again.
-	derpDirectRetryInterval = 30 * time.Second
-	derpDirectBackoffBase   = time.Minute
-	derpDirectBackoffMax    = 15 * time.Minute
+	derpDirectRetryInterval    = 30 * time.Second
+	derpDirectBackoffBase      = time.Minute
+	derpDirectBackoffMax       = 15 * time.Minute
+	derpDirectProbeDialTimeout = 650 * time.Millisecond
+	derpDirectProbeTLSTimeout  = 3 * time.Second
 	// A direct connection that has read something and is still open this
 	// long clears its path's backoff. One that wrote and ends without
 	// reading a byte failed: that is how a reset handshake looks.
@@ -308,6 +310,8 @@ type directDERPConn struct {
 	opened  time.Time
 	wrote   atomic.Bool
 	read    atomic.Bool
+	ioErr   atomic.Bool
+	closing atomic.Bool
 	once    sync.Once
 	healthy *time.Timer
 }
@@ -315,7 +319,7 @@ type directDERPConn struct {
 func (r *tailscaleDERPRoutes) watchDirect(conn net.Conn, key, address string) net.Conn {
 	c := &directDERPConn{Conn: conn, routes: r, key: key, address: address, opened: time.Now()}
 	c.healthy = time.AfterFunc(derpDirectHealthyAfter, func() {
-		if c.read.Load() {
+		if c.read.Load() && !c.ioErr.Load() && !c.closing.Load() {
 			r.directHealthy(key)
 		}
 	})
@@ -327,6 +331,9 @@ func (c *directDERPConn) Read(b []byte) (int, error) {
 	if n > 0 {
 		c.read.Store(true)
 	}
+	if err != nil && !c.closing.Load() {
+		c.ioErr.Store(true)
+	}
 	return n, err
 }
 
@@ -335,20 +342,29 @@ func (c *directDERPConn) Write(b []byte) (int, error) {
 	if n > 0 {
 		c.wrote.Store(true)
 	}
+	if err != nil && !c.closing.Load() {
+		c.ioErr.Store(true)
+	}
 	return n, err
 }
 
 func (c *directDERPConn) Close() error {
+	c.closing.Store(true)
 	c.once.Do(func() {
 		c.healthy.Stop()
 		if !c.wrote.Load() {
 			return
 		}
 		if c.read.Load() {
-			if time.Since(c.opened) >= derpDirectHealthyAfter {
-				c.routes.directHealthy(c.key)
+			if !c.ioErr.Load() {
+				if time.Since(c.opened) >= derpDirectHealthyAfter {
+					c.routes.directHealthy(c.key)
+				}
+				return
 			}
-			return
+			if time.Since(c.opened) >= derpDirectHealthyAfter {
+				return
+			}
 		}
 		backoff := c.routes.directFailed(c.key)
 		log.Infoln("[Tailscale] direct DERP connection to %s ended early, using the proxy for %v", c.address, backoff)
@@ -412,13 +428,15 @@ func (r *tailscaleDERPRoutes) trackFallback(conn net.Conn, network, address, key
 				timer.Reset(interval)
 				continue
 			}
-			ctx, cancel := context.WithTimeout(baseCtx, 5*time.Second)
-			probe, err := direct().DialContext(ctx, network, address)
+			dialCtx, dialCancel := context.WithTimeout(baseCtx, derpDirectProbeDialTimeout)
+			probe, err := direct().DialContext(dialCtx, network, address)
+			dialCancel()
 			if err == nil {
-				err = derpDirectProbe(ctx, probe, serverName)
+				tlsCtx, tlsCancel := context.WithTimeout(baseCtx, derpDirectProbeTLSTimeout)
+				err = derpDirectProbe(tlsCtx, probe, serverName)
+				tlsCancel()
 				_ = probe.Close()
 			}
-			cancel()
 			if baseCtx.Err() != nil {
 				return
 			}
