@@ -5,6 +5,7 @@ package outbound
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -480,5 +481,111 @@ func TestFallbackProbeStopsOnCloseAll(t *testing.T) {
 	time.Sleep(80 * time.Millisecond)
 	if probeCalls.Load() != after {
 		t.Fatalf("fallback probe continued after closeAll: %d -> %d", after, probeCalls.Load())
+	}
+}
+
+func TestDirectDERPEarlyDropAfterReadBacksOff(t *testing.T) {
+	var routes tailscaleDERPRoutes
+	routes.set(testDERPMap())
+	proxy := &fakeStreamDialer{}
+	var directCalls atomic.Int32
+	direct := streamDialerFunc(func() (net.Conn, error) {
+		directCalls.Add(1)
+		a, b := net.Pipe()
+		go func() {
+			_, _ = b.Read(make([]byte, 64))
+			_, _ = b.Write([]byte("server hello"))
+			_ = b.Close()
+		}()
+		return a, nil
+	})
+	directOf := func() tailscaleStreamDialer { return direct }
+
+	conn, err := dialSystemVia(context.Background(), &routes, proxy, "group", directOf, "ts", "tcp4", "1.1.1.4:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write([]byte("client hello")); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := conn.Read(make([]byte, 32)); err != nil || n == 0 {
+		t.Fatalf("first read = (%d, %v), want >0 bytes before peer drop", n, err)
+	}
+	if _, err := conn.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("second read = %v, want EOF", err)
+	}
+	_ = conn.Close()
+
+	next, err := dialSystemVia(context.Background(), &routes, proxy, "group", directOf, "ts", "tcp4", "1.1.1.4:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Close()
+	if directCalls.Load() != 1 || len(proxy.calls) != 1 {
+		t.Fatalf("early post-read drop must back off to proxy: direct=%d proxy=%v", directCalls.Load(), proxy.calls)
+	}
+	if got := routes.Routes()["fra"]; got != TailscaleRouteProxy {
+		t.Fatalf("route = %q, want %q", got, TailscaleRouteProxy)
+	}
+}
+
+type slowDialer struct {
+	delay time.Duration
+}
+
+func (d slowDialer) DialContext(ctx context.Context, _, _ string) (net.Conn, error) {
+	timer := time.NewTimer(d.delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		a, b := net.Pipe()
+		_ = b.Close()
+		return a, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestFallbackProbeRejectsSlowDirectDial(t *testing.T) {
+	fastDERPRetries(t)
+	origDialTimeout := derpDirectProbeDialTimeout
+	derpDirectProbeDialTimeout = 30 * time.Millisecond
+	t.Cleanup(func() { derpDirectProbeDialTimeout = origDialTimeout })
+
+	var routes tailscaleDERPRoutes
+	routes.set(testDERPMap())
+	defer routes.closeAll()
+
+	var slowPhase atomic.Bool
+	proxyA, proxyB := net.Pipe()
+	defer proxyB.Close()
+	conn, err := dialSystemVia(context.Background(), &routes,
+		streamDialerFunc(func() (net.Conn, error) { return proxyA, nil }),
+		"group",
+		func() tailscaleStreamDialer {
+			if slowPhase.Load() {
+				return slowDialer{delay: 120 * time.Millisecond}
+			}
+			return streamDialerFunc(func() (net.Conn, error) { return nil, errors.New("direct down") })
+		},
+		"ts", "tcp4", "1.1.1.4:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	slowPhase.Store(true)
+
+	done := make(chan struct{})
+	go func() { _, _ = proxyB.Read(make([]byte, 1)); close(done) }()
+	select {
+	case <-done:
+		t.Fatal("proxied connection closed despite direct probe exceeding dial budget")
+	case <-time.After(150 * time.Millisecond):
+	}
+	routes.mu.Lock()
+	failures := routes.health[derpHealthKey("tcp4", "1.1.1.4:443")].failures
+	routes.mu.Unlock()
+	if failures < 2 {
+		t.Fatalf("timed-out direct probe must increment failures, got %d", failures)
 	}
 }
